@@ -1,0 +1,322 @@
+/*
+  ME 4015 Final Project - Group 3, Hayden Boyd, Tyler Chambers
+  Arduino Uno + MAX6675 + 2× RobotDyn AC Dimmer
+
+  - Both ZC pins connected to D2
+  - Light PSM → D10
+  - Fan   PSM → D9
+  - Proper OFF using setState(OFF)
+*/
+
+#include <RBDdimmer.h>
+#include "max6675.h"
+
+// ================== PINS ==================
+#define THERMO_SO   4
+#define THERMO_CS   5
+#define THERMO_SCK  6
+
+#define FAN_PSM     9
+#define LIGHT_PSM  10
+
+// ================== OBJECTS ==================
+MAX6675 thermocouple(THERMO_SCK, THERMO_CS, THERMO_SO);
+dimmerLamp fanDimmer(FAN_PSM);
+dimmerLamp lightDimmer(LIGHT_PSM);
+
+// ================== TUNING ==================
+float Kp = 24.0; //1st 8.0 too slow, 2nd 14.0 Still slow, 3rd 22.0 works better could probably be a little faster,
+float Ki = 0.55; //1st .15 too slow, 2nd .25 sat at edge of tolerance, 3rd .45 works meets requirements but would be okay with more overshoot,
+float Kd = .25; //1st 2.0 reaction to slowing down too early, 2nd .6 Slows down a little early still, 3rd .3 seems okay maybe small adjustments,
+
+float heaterMax = 95;
+float fanMax    = 80;
+float deadband  = 0.5;
+
+// How close temperature must be before starting the hold timer
+const float HOLD_ENTRY_TOLERANCE = 1.5;   // °F
+
+// ================== VARIABLES ==================
+float setpoint     = 80.0;
+float temperature  = 0;
+float error        = 0;
+float lastError    = 0;
+float integral     = 0;
+
+unsigned long lastControlTime = 0;
+const unsigned long CONTROL_INTERVAL = 500;   // ms
+
+enum ProfileState {
+  IDLE,
+  RAMP_TO_80,
+  HOLD_80,
+  RAMP_TO_100,
+  HOLD_100,
+  RAMP_BACK_80,
+  HOLD_FINAL,
+  DONE
+};
+ProfileState state = IDLE;
+
+unsigned long holdStart = 0;
+const unsigned long HOLD_TIME = 65000;   // 65 seconds
+
+String inputString = "";
+bool stringComplete = false;
+
+// ================== FUNCTION PROTOTYPES ==================
+void runController();
+void runProfile();
+void handleSerialCommand(String cmd);
+
+// =========================================================
+void setup() {
+  Serial.begin(9600);
+  delay(600);   // give MAX6675 time to settle
+
+  fanDimmer.begin(NORMAL_MODE, ON);
+  lightDimmer.begin(NORMAL_MODE, ON);
+
+  // Start fully OFF
+  fanDimmer.setState(OFF);
+  lightDimmer.setState(OFF);
+
+  Serial.println(F("===================================="));
+  Serial.println(F("Thermostat Ready"));
+  Serial.println(F("Commands:"));
+  Serial.println(F("  S80 / S100 / Sxx   → set temperature"));
+  Serial.println(F("  P                 → start 80→100→80 profile"));
+  Serial.println(F("  H                 → hold current setpoint"));
+  Serial.println(F("  0                 → both outputs OFF"));
+  Serial.println(F("===================================="));
+}
+
+// =========================================================
+void loop() {
+  // ---- Read temperature ----
+  static unsigned long lastTempRead = 0;
+  if (millis() - lastTempRead >= 250) {
+    temperature = thermocouple.readFahrenheit();
+    lastTempRead = millis();
+  }
+
+  // ---- Control loop ----
+  if (millis() - lastControlTime >= CONTROL_INTERVAL) {
+    lastControlTime = millis();
+    runController();
+  }
+
+  // ---- Profile state machine ----
+  runProfile();
+
+  // ---- Serial commands ----
+  if (stringComplete) {
+    handleSerialCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+
+  // ---- Status print every 2 seconds ----
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 2000) {
+    lastPrint = millis();
+
+    // Timestamp mm:ss
+    unsigned long totalSec = millis() / 1000;
+    unsigned int min = totalSec / 60;
+    unsigned int sec = totalSec % 60;
+
+    Serial.print(min);
+    Serial.print(F(":"));
+    if (sec < 10) Serial.print('0');
+    Serial.print(sec);
+
+    Serial.print(F("  T="));
+    Serial.print(temperature, 1);
+    Serial.print(F("  SP="));
+    Serial.print(setpoint, 1);
+
+    Serial.print(F("  Light="));
+    if (lightDimmer.getState()) Serial.print(lightDimmer.getPower());
+    else Serial.print(0);
+    Serial.print(F("%  Fan="));
+    if (fanDimmer.getState()) Serial.print(fanDimmer.getPower());
+    else Serial.print(0);
+    Serial.print(F("%  "));
+
+    // Readable state name
+    switch (state) {
+      case IDLE:         Serial.println(F("IDLE")); break;
+      case RAMP_TO_80:   Serial.println(F("RAMP→80")); break;
+      case HOLD_80:      Serial.println(F("HOLD 80")); break;
+      case RAMP_TO_100:  Serial.println(F("RAMP→100")); break;
+      case HOLD_100:     Serial.println(F("HOLD 100")); break;
+      case RAMP_BACK_80: Serial.println(F("RAMP→80")); break;
+      case HOLD_FINAL:   Serial.println(F("FINAL HOLD 80")); break;
+      case DONE:         Serial.println(F("DONE")); break;
+    }
+  }
+}
+
+// =========================================================
+// CONTROLLER
+// =========================================================
+void runController() {
+  error = setpoint - temperature;
+
+  // Integral with anti-windup
+  if (abs(error) < 15.0) {
+    integral += error * (CONTROL_INTERVAL / 1000.0);
+    integral = constrain(integral, -50.0, 50.0);
+  } else {
+    integral *= 0.9;
+  }
+
+  float derivative = (error - lastError) / (CONTROL_INTERVAL / 1000.0);
+  lastError = error;
+
+  float output = Kp * error + Ki * integral + Kd * derivative;
+
+  int lightPower = 0;
+  int fanPower   = 0;
+
+  if (error > deadband) {                 // need heating
+    lightPower = constrain(output, 0, heaterMax);
+    fanPower   = 0;
+  }
+  else if (error < -deadband) {           // need cooling
+    lightPower = 0;
+    fanPower   = constrain(-output, 0, fanMax);
+  }
+  else {                                  // inside deadband
+    lightPower = 0;
+    fanPower   = 0;
+  }
+
+  // Proper ON / OFF handling
+  if (lightPower > 0) {
+    lightDimmer.setState(ON);
+    lightDimmer.setPower(lightPower);
+  } else {
+    lightDimmer.setState(OFF);
+  }
+
+  if (fanPower > 0) {
+    fanDimmer.setState(ON);
+    fanDimmer.setPower(fanPower);
+  } else {
+    fanDimmer.setState(OFF);
+  }
+}
+
+// =========================================================
+// PROFILE STATE MACHINE
+// =========================================================
+void runProfile() {
+  switch (state) {
+    case IDLE:
+      break;
+
+    case RAMP_TO_80:
+      setpoint = 80.0;
+      if (abs(temperature - 80.0) <= HOLD_ENTRY_TOLERANCE) {
+        holdStart = millis();
+        state = HOLD_80;
+        Serial.println(F(">>> HOLDING 80°F"));
+      }
+      break;
+
+    case HOLD_80:
+      setpoint = 80.0;
+      if (millis() - holdStart >= HOLD_TIME) {
+        state = RAMP_TO_100;
+        Serial.println(F(">>> RAMPING TO 100°F"));
+      }
+      break;
+
+    case RAMP_TO_100:
+      setpoint = 100.0;
+      if (abs(temperature - 100.0) <= HOLD_ENTRY_TOLERANCE) {
+        holdStart = millis();
+        state = HOLD_100;
+        Serial.println(F(">>> HOLDING 100°F"));
+      }
+      break;
+
+    case HOLD_100:
+      setpoint = 100.0;
+      if (millis() - holdStart >= HOLD_TIME) {
+        state = RAMP_BACK_80;
+        Serial.println(F(">>> RAMPING BACK TO 80°F"));
+      }
+      break;
+
+    case RAMP_BACK_80:
+      setpoint = 80.0;
+      if (abs(temperature - 80.0) <= HOLD_ENTRY_TOLERANCE) {
+        holdStart = millis();
+        state = HOLD_FINAL;
+        Serial.println(F(">>> FINAL HOLD 80°F"));
+      }
+      break;
+
+    case HOLD_FINAL:
+      setpoint = 80.0;
+      if (millis() - holdStart >= HOLD_TIME) {
+        state = DONE;
+        lightDimmer.setState(OFF);
+        fanDimmer.setState(OFF);
+        Serial.println(F(">>> PROFILE COMPLETE"));
+      }
+      break;
+
+    case DONE:
+      break;
+  }
+}
+
+// =========================================================
+// SERIAL COMMANDS
+// =========================================================
+void handleSerialCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd.startsWith("S")) {
+    float sp = cmd.substring(1).toFloat();
+    if (sp >= 70.0 && sp <= 110.0) {
+      setpoint = sp;
+      state = IDLE;
+      integral = 0;
+      Serial.print(F("Setpoint set to "));
+      Serial.println(setpoint);
+    }
+  }
+  else if (cmd == "P") {
+    state = RAMP_TO_80;
+    integral = 0;
+    Serial.println(F("Starting profile 80 → 100 → 80"));
+  }
+  else if (cmd == "H") {
+    state = IDLE;
+    Serial.println(F("Holding current setpoint"));
+  }
+  else if (cmd == "0") {
+    lightDimmer.setState(OFF);
+    fanDimmer.setState(OFF);
+    state = IDLE;
+    Serial.println(F("Both outputs OFF"));
+  }
+}
+
+// =========================================================
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n' || inChar == '\r') {
+      stringComplete = true;
+    } else {
+      inputString += inChar;
+    }
+  }
+}
